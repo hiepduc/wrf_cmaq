@@ -19,46 +19,6 @@ import xarray as xr
 import pandas as pd
 import numpy as np
 
-def load_day_domain_nc(nc_path, variable, lat_target, lon_target):
-    try:
-        ds = xr.open_dataset(nc_path)
-
-        # Find nearest lat/lon grid
-        lats = ds['LAT'].values if 'LAT' in ds else ds['lat'].values
-        lons = ds['LON'].values if 'LON' in ds else ds['lon'].values
-        dist = np.sqrt((lats - lat_target)**2 + (lons - lon_target)**2)
-        i_lat, i_lon = np.unravel_index(np.argmin(dist), dist.shape)
-
-        ts = ds[variable][:, 0, i_lat, i_lon]
-        times = pd.to_datetime(ds['time'].values)
-
-        return pd.DataFrame({'Time': times, variable: ts.values})
-    except Exception as e:
-        print(f"❌ Failed to load {nc_path.name}: {e}")
-        return None
-
-def build_timeseries_across_days(base_dir, variable, lat, lon, domain="d03"):
-    all_dfs = []
-
-    base = Path(base_dir)
-    for date_dir in sorted(base.glob("20*/")):
-        domain_dir = date_dir / domain
-        nc_files = list(domain_dir.glob("CCTM_ACONC_*.nc"))
-
-        if not nc_files:
-            continue
-
-        for nc_file in nc_files:
-            df = load_day_domain_nc(nc_file, variable, lat, lon)
-            if df is not None:
-                all_dfs.append(df)
-
-    if all_dfs:
-        df_full = pd.concat(all_dfs).drop_duplicates(subset="Time").sort_values("Time")
-        return df_full.set_index("Time")
-    else:
-        return pd.DataFrame()
-
 @st.cache_data(show_spinner=True)
 def fetch_observation_data(station_name, parameter_code, start_date_str, end_date_str):
     API_URL = "https://data.airquality.nsw.gov.au/api/Data/get_Observations"
@@ -135,35 +95,118 @@ def compute_metrics(df):
 
 
 # --- Function to generate lat/lon grid from GRIDDESC ---
-def generate_latlon_grid_from_griddesc():
-    # Projection info from GRIDDESC
-    lat1 = -34.0
-    lat2 = -22.0
-    central_lon = 134.0
-    center_lat = -28.0  # Projection origin
-    x0 = -2190000.000
-    y0 = -1901999.125
-    dx = 12000.0
-    dy = 12000.0
-    nx = 365
-    ny = 317
+def generate_latlon_grid_from_griddesc(griddesc_file):
+    """
+    Read MCIP GRIDDESC and return lon2d, lat2d and grid_info dict.
+    grid_info contains: xcell (m), ycell (m), nx, ny, origin_x, origin_y
+    """
+    import numpy as np
+    from pyproj import Proj, Transformer
 
-    # Create grid in projected coordinates
-    x = x0 + dx * (np.arange(nx) + 0.5)
-    y = y0 + dy * (np.arange(ny) + 0.5)
-    X, Y = np.meshgrid(x, y)
+    # read and strip quotes / empty lines
+    with open(griddesc_file, "r") as f:
+        lines = [ln.strip().replace("'", "") for ln in f if ln.strip()]
 
-    # Lambert Conformal projection (same as in WRF)
-    lambert_proj = Proj(proj="lcc", lat_1=lat1, lat_2=lat2, lat_0=center_lat,
-                        lon_0=central_lon, ellps="WGS84")
+    # 1) find the *grid definition* line: looks like
+    #    <proj_name>  origin_x origin_y xcell ycell nx ny ...
+    proj_name = None
+    origin_x = origin_y = xcell = ycell = nx = ny = None
+    for ln in lines:
+        toks = ln.split()
+        if len(toks) >= 7:
+            # first token is non-numeric (projection name), rest mostly numeric
+            try:
+                # try parse tokens[1:] as floats -> if many succeed it's the grid line
+                nums = [float(t) for t in toks[1:] ]
+                if len(nums) >= 6:
+                    proj_name = toks[0]
+                    origin_x, origin_y, xcell, ycell = nums[0], nums[1], nums[2], nums[3]
+                    nx, ny = int(round(nums[4])), int(round(nums[5]))
+                    break
+            except Exception:
+                continue
 
-    # Convert to lat/lon
+    if proj_name is None:
+        raise ValueError(f"Could not find grid-definition line in GRIDDESC: {griddesc_file}")
+
+    # 2) find projection parameters for proj_name: look for a separate line equal to proj_name
+    #    followed by a numeric line like: 2 lat1 lat2 lon1 lon2 lat0
+    lat1 = lat2 = lon0 = lat0 = None
+    for i, ln in enumerate(lines):
+        if ln == proj_name:
+            # next line should have projection params
+            if i + 1 < len(lines):
+                toks = lines[i + 1].split()
+                # try parse numeric tokens
+                nums = []
+                for t in toks:
+                    try:
+                        nums.append(float(t))
+                    except Exception:
+                        pass
+                # expected pattern: [code, lat1, lat2, lon1, lon2, lat0] (based on examples)
+                if len(nums) >= 6:
+                    lat1 = nums[1]
+                    lat2 = nums[2]
+                    lon0 = nums[3]   # usually the central meridian
+                    lat0 = nums[5]
+                    break
+
+    if any(v is None for v in (lat1, lat2, lon0, lat0)):
+        # fallback: try to find any line with 6 numeric tokens and use that
+        for ln in lines:
+            toks = ln.split()
+            nums = []
+            for t in toks:
+                try:
+                    nums.append(float(t))
+                except Exception:
+                    pass
+            if len(nums) >= 6:
+                lat1, lat2, lon0, lat0 = nums[1], nums[2], nums[3], nums[5]
+                break
+
+    if any(v is None for v in (lat1, lat2, lon0, lat0)):
+        raise ValueError("Could not determine projection parameters (lat1, lat2, lon0, lat0) from GRIDDESC.")
+
+    # 3) build projected grid (cell centers)
+    x = origin_x + xcell * (np.arange(nx) + 0.5)
+    y = origin_y + ycell * (np.arange(ny) + 0.5)
+    X, Y = np.meshgrid(x, y)   # shape (ny, nx)
+
+    # 4) transform to lat/lon using Lambert Conformal Conic
+    lambert_proj = Proj(proj="lcc", lat_1=lat1, lat_2=lat2, lat_0=lat0,
+                        lon_0=lon0, ellps="WGS84")
     transformer = Transformer.from_proj(lambert_proj, "epsg:4326", always_xy=True)
     lon2d, lat2d = transformer.transform(X, Y)
 
-    return lon2d, lat2d
+    grid_info = {
+        "proj_name": proj_name,
+        "origin_x": origin_x,
+        "origin_y": origin_y,
+        "xcell": xcell,
+        "ycell": ycell,
+        "nx": nx,
+        "ny": ny,
+        "lat1": lat1,
+        "lat2": lat2,
+        "lon0": lon0,
+        "lat0": lat0
+    }
 
-def plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind):
+    return lon2d, lat2d, grid_info
+
+# Adjust the step size for plotting wind vector density based on domain size (nx, ny)
+def calculate_step_size(nx, ny):
+    # Simple logic to reduce step size for smaller grids
+    if nx < 400 and ny < 400:
+        return 16  # Increase step size (fewer arrows) for smaller domains
+    elif nx < 800 and ny < 800:
+        return 4  # A moderate step for mid-sized domains
+    else:
+        return 2  # Default step for larger domains like d03
+
+def plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind, nx, ny):
     data = ds[variable].isel(TSTEP=time_index, LAY=0)
     fig, ax = plt.subplots(figsize=(8, 6), subplot_kw={'projection': ccrs.PlateCarree()})
     mesh = ax.pcolormesh(lon2d, lat2d, data.values, transform=ccrs.PlateCarree(), cmap='viridis', shading='auto', zorder=1)
@@ -179,24 +222,29 @@ def plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds,
             uu = wrf_sel["UU"].isel(num_metgrid_levels=0).values
             vv = wrf_sel["VV"].isel(num_metgrid_levels=0).values
 
-            # Unstagger U and trim to 365x317
+            # Unstagger U and trim or interpolate to match CMAQ grid
             u_unstaggered = 0.5 * (uu[:, :-1] + uu[:, 1:])
             v_unstaggered = 0.5 * (vv[:-1, :] + vv[1:, :])
 
-            # Trim or crop to match the 365x317 CMAQ grid
-            u = u_unstaggered[:317, :365]
-            v = v_unstaggered[:317, :365]
+            # Trim or interpolate to the CMAQ grid resolution (nx, ny)
+            u_trimmed = u_unstaggered[:ny, :nx]
+            v_trimmed = v_unstaggered[:ny, :nx]
 
-            # Generate lat/lon grid from GRIDDESC
-            # You already have:
-            # lon2d, lat2d = generate_latlon_grid_from_griddesc()
+            # If the WRF grid is smaller than CMAQ, we need to interpolate
+            if u_trimmed.shape != (ny, nx):
+                from scipy.interpolate import interp2d
+                f_u = interp2d(np.arange(u_unstaggered.shape[1]), np.arange(u_unstaggered.shape[0]), u_unstaggered)
+                f_v = interp2d(np.arange(v_unstaggered.shape[1]), np.arange(v_unstaggered.shape[0]), v_unstaggered)
+                u_trimmed = f_u(np.linspace(0, u_unstaggered.shape[1] - 1, nx), np.linspace(0, u_unstaggered.shape[0] - 1, ny))
+                v_trimmed = f_v(np.linspace(0, v_unstaggered.shape[1] - 1, nx), np.linspace(0, v_unstaggered.shape[0] - 1, ny))
 
-            step = 14
+            # Generate lat/lon grid from GRIDDESC (use the previously calculated lon2d, lat2d)
+            step = calculate_step_size(nx, ny)  # Calculate the step based on grid size
             ax.quiver(
                 lon2d[::step, ::step],
                 lat2d[::step, ::step],
-                u[::step, ::step],
-                v[::step, ::step],
+                u_trimmed[::step, ::step],
+                v_trimmed[::step, ::step],
                 transform=ccrs.PlateCarree(),
                 scale=50,
                 width=0.002,
@@ -216,37 +264,135 @@ def plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds,
     ax.set_title(f"{variable} + Wind Vectors at {cmaq_time}")
     return fig
 
-
 # --- Streamlit app ---
 st.set_page_config(layout="wide")
 st.title("CMAQ Concentration Viewer with Time Series")
 
-nc_path = st.sidebar.text_input("Path to CMAQ base directory of daily NetCDF file:",
-    "/home/duch/cmaq/khaliaforecast/20240207_M200/esme_local/forecast/run/CTM")
+# --- Sidebar ---
+st.sidebar.header("Configuration")
 
-# Base directory containing daily folders of CMAQ output
-base_dir = "/home/duch/cmaq/khaliaforecast/20240207_M200/esme_local/forecast/run/CTM"
+# Domain selection
+domain = st.sidebar.selectbox("Select CMAQ Domain", ["d01", "d02", "d03"])
 
-# Base directory containing WRF meteorological files
-base_dir_wrf = "/home/duch/cmaq/khaliaforecast/20240207_M200/esme_local/forecast/run/WRF/run/met_em.d01.*.nc"
+# Paths
+cmaq_base = st.sidebar.text_input(
+    "Path to CMAQ base directory of daily NetCDF files:",
+    "/home/duch/cmaq/khaliaforecast/20240207_M200/esme_local/forecast/run/CTM"
+)
 
-# Get all d01 NetCDF files across date subdirectories
-file_list = sorted(glob.glob(os.path.join(base_dir, "2024-*/d01/CCTM_ACONC_v532_intel_d01_*.nc")))
+mcip_base = st.sidebar.text_input(
+    "Path to MCIP base directory:",
+    "/home/duch/cmaq/khaliaforecast/20240207_M200/esme_local/forecast/run/MCIP"
+)
 
-# Debug print (optional)
-print(f"Found {len(file_list)} files:")
-for f in file_list:
-    print("  ", f)
+wrf_base = st.sidebar.text_input(
+    "Path to WRF meteorological base directory:",
+    "/home/duch/cmaq/khaliaforecast/20240207_M200/esme_local/forecast/run/WRF/run"
+)
 
+# --- Helper: Read GRIDDESC ---
+import re
 
-if nc_path:
+def read_griddesc(griddesc_file):
+    """
+    Robustly parse GRIDDESC. Returns dict with xcell (m), ycell (m), nx, ny
+    or None if not found/parsable.
+    """
+    with open(griddesc_file, "r") as f:
+        lines = [ln.strip().replace("'", "") for ln in f if ln.strip()]
+
+    for line in lines:
+        # split into tokens
+        tokens = line.split()
+        # try to convert tokens to floats where possible
+        floats = []
+        for tok in tokens:
+            # allow things like -2190000.000 or 12000.000
+            try:
+                v = float(tok)
+                floats.append(v)
+            except Exception:
+                # skip non-numeric tokens
+                continue
+
+        # we expect at least 6-7 numeric fields in the interesting line
+        # pattern seen: [x0, y0, xcell, ycell, nx, ny, something]
+        if len(floats) >= 6:
+            # pick the slice that matches typical GRIDDESC layout:
+            # use the last 5..2 numeric tokens: [ ..., xcell, ycell, nx, ny, ... ]
+            # we'll choose floats[-5], floats[-4], floats[-3], floats[-2]
+            try:
+                xcell = float(floats[-5])
+                ycell = float(floats[-4])
+                nx = int(round(floats[-3]))
+                ny = int(round(floats[-2]))
+
+                # basic sanity checks
+                if xcell > 0 and ycell > 0 and nx > 0 and ny > 0:
+                    return {"xcell": xcell, "ycell": ycell, "nx": nx, "ny": ny}
+            except Exception:
+                # if any conversion fails, skip this line
+                continue
+
+    return None
+
+# --- Find GRIDDESC file for chosen domain ---
+date_dirs = sorted(glob.glob(os.path.join(mcip_base, "2024-*")))
+if not date_dirs:
+    st.error(f"No date directories found in {mcip_base}")
+else:
+    # Pick first date folder
+    first_date = date_dirs[0]
+    griddesc_file = os.path.join(first_date, domain, "GRIDDESC")
+    if os.path.exists(griddesc_file):
+        grid_info = read_griddesc(griddesc_file)
+        if grid_info:
+            st.sidebar.write(f"Grid resolution: {grid_info['xcell']/1000:.1f} km")
+            st.sidebar.write(f"Grid size: {grid_info['nx']} x {grid_info['ny']}")
+        else:
+            st.error(f"Could not parse grid info from {griddesc_file}")
+    else:
+        st.error(f"GRIDDESC not found: {griddesc_file}")
+
+# --- File discovery ---
+if os.path.exists(cmaq_base):
+    file_list = sorted(glob.glob(
+        os.path.join(cmaq_base, f"2024-*/{domain}/CCTM_ACONC_v532_intel_{domain}_*.nc")
+    ))
+    st.sidebar.write(f"Found {len(file_list)} CMAQ files.")
+
+    wrf_files = sorted(glob.glob(
+        os.path.join(wrf_base, f"met_em.{domain}.*.nc")
+    ))
+    st.sidebar.write(f"Found {len(wrf_files)} WRF files.")
+else:
+    st.warning("Please check your CMAQ base directory path.")
+
+# Now you can continue your existing code using `file_list` and `wrf_files`
+
+#if nc_path:
+if file_list:
     try:
-        # Combine all files into one Dataset
+        valid_files = []
+        for f in file_list:
+            try:
+                #with xr.open_dataset(f, engine="pseudonetcdf") as test_ds:
+                with xr.open_dataset(f) as test_ds:
+                    _ = test_ds.variables  # force load metadata
+                valid_files.append(f)
+                print(f"OK: {f}")
+            except Exception as e:
+                print(f"Skipping {f}: {e}")
+
+        if not valid_files:
+            raise RuntimeError("No valid CMAQ files found!")
+
+        # Now combine only valid files
         ds = xr.open_mfdataset(
-            file_list,
+            valid_files,
             combine="nested",
             concat_dim="TSTEP",
-            #compat="override",  # override metadata conflict
+            #engine="netcdf4",
             parallel=True
         )
 
@@ -272,10 +418,23 @@ if nc_path:
         animate = st.sidebar.checkbox("Play Animation")
 
         # Generate lon/lat grid once
-        lon2d, lat2d = generate_latlon_grid_from_griddesc()
+        #lon2d, lat2d = generate_latlon_grid_from_griddesc(griddesc_file, "WRFtestCMAQ")
+        #griddesc_file = "/home/duch/cmaq/khaliaforecast/20240207_M200/esme_local/forecast/run/MCIP/2024-02-07/d01/GRIDDESC"
+        #lon2d, lat2d, grid_info = generate_latlon_grid_from_griddesc(griddesc_file, "WRFtestCMAQ")
+        # find the GRIDDESC for chosen domain & date (example uses first date found)
+        griddesc_file = os.path.join(first_date, domain, "GRIDDESC")
+        lon2d, lat2d, grid_info = generate_latlon_grid_from_griddesc(griddesc_file)
+
+        #st.sidebar.write(f"Grid resolution: {grid_info['xcell']/1000:.1f} km")
+        #st.sidebar.write(f"Grid size: {grid_info['nx']} x {grid_info['ny']}")
+
+        print(f"Grid resolution: {grid_info['xcell']/1000:.1f} km")
+        print(f"Grid size: {grid_info['nx']} x {grid_info['ny']}")
 
         # Load WRF files once for animation or static
-        wrf_files = sorted(glob.glob(base_dir_wrf))
+        wrf_files = sorted(glob.glob(os.path.join(wrf_base, f"met_em.{domain}.*.nc")))
+        #wrf_ds = xr.open_mfdataset(wrf_files, combine='nested', concat_dim="Time", engine="netcdf4")
+        #wrf_ds = xr.open_mfdataset(wrf_files, combine='nested', concat_dim="Time", engine="pseudonetcdf")
         wrf_ds = xr.open_mfdataset(wrf_files, combine='nested', concat_dim="Time")
 
         # Animation mode
@@ -292,7 +451,12 @@ if nc_path:
             for time_index in range(len(times)):
                 cmaq_time = times[time_index]
                 with placeholder.container():
-                    fig = plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind)
+                    #fig = plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind)
+                    # Plot concentration with wind
+                    fig = plot_concentration_with_wind(
+                        ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind=True, nx=grid_info["nx"], ny=grid_info["ny"]
+                    )
+
                     st.pyplot(fig)
 
                     if record:
@@ -312,7 +476,10 @@ if nc_path:
         else:
             time_index = st.sidebar.slider("Select time index", 0, len(times) - 1, 0)
             cmaq_time = times[time_index]
-            fig = plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind)
+            # fig = plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind)
+            fig = plot_concentration_with_wind(
+                ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind=True, nx=grid_info["nx"], ny=grid_info["ny"]
+            )
             st.pyplot(fig)
 
         st.sidebar.write(f"Selected time: {times[time_index]}")
@@ -321,7 +488,7 @@ if nc_path:
         st.subheader("Click on the map to see time series")
         center_lat = np.mean(lat2d)
         center_lon = np.mean(lon2d)
-        fmap = folium.Map(location=[center_lat, center_lon], zoom_start=4)
+        fmap = folium.Map(location=[center_lat, center_lon], zoom_start=5)
 
         stations = [
             {"name": "PARRAMATTA NORTH", "lat": -33.797, "lon": 151.002},

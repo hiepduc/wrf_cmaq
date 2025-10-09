@@ -1,5 +1,7 @@
 import streamlit as st
 import xarray as xr
+import matplotlib
+matplotlib.use('TkAgg')  # or 'Qt5Agg'
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -18,6 +20,17 @@ from pathlib import Path
 import xarray as xr
 import pandas as pd
 import numpy as np
+import fnmatch
+
+# Domain selection
+domain = "d01"
+
+# Paths
+cmaq_base = "/mnt/scratch_lustre/ar_policy/whe_project/esme_local/jul13_S4_fix/run/CTM"
+
+mcip_base = "/mnt/scratch_lustre/ar_policy/whe_project/esme_local/jul13_S4_fix/run/MCIP"
+
+wrf_base = "/mnt/scratch_lustre/ar_policy/whe_project/esme_local/wrf_gmr_2013/run/WPS"
 
 @st.cache_data(show_spinner=True)
 def fetch_observation_data(station_name, parameter_code, start_date_str, end_date_str):
@@ -78,8 +91,8 @@ def fetch_observation_data(station_name, parameter_code, start_date_str, end_dat
 from sklearn.metrics import mean_squared_error
 
 def compute_metrics(df):
-    obs = df["obs"]
-    pred = df["pred"]
+    obs = df["Observed"]
+    pred = df["Model"]
 
     correlation = obs.corr(pred)
     rmse = mean_squared_error(obs, pred, squared=False)
@@ -196,8 +209,163 @@ def generate_latlon_grid_from_griddesc(griddesc_file):
 
     return lon2d, lat2d, grid_info
 
+def find_apmdiag_for_aconc(aconc_path):
+    """Given path to a CCTM_ACONC file or to a directory containing them,
+    try to find the corresponding CCT_AELMO* file in the same directory."""
+    
+    if os.path.isdir(aconc_path):
+        base_dir = aconc_path
+    else:
+        base_dir = os.path.dirname(aconc_path)
+    
+    # Debugging: Print the directory we are searching
+    print(f"Looking for AELMO in: {base_dir}")
+    
+    # Look for files named like CCT_APMDIAG*.nc in that directory
+    for fname in sorted(os.listdir(base_dir)):
+        print(f"Checking file: {fname}")  # Debugging: Print file names found in the directory
+        if fname.startswith("CCTM_AELMO"):  # Match the prefix directly
+            print(f"Found AELMO file: {fname}")  # Debugging: Found the correct file
+            return os.path.join(base_dir, fname)
+    
+    # Debugging: If no file is found
+    print("AELMO file not found!")
+    return None
+
+def compute_pm25_from_aelmo_for_all_days(ds_apmdiag):
+    """Compute PM2.5 for all days using the formula and available data."""
+    # Initialize an array to store PM2.5 for all days
+    pm25_all_days = []
+    pm10_all_days = []
+
+    # Loop through all time steps (TSTEP)
+    for t in range(ds_apmdiag.sizes['TSTEP']):
+        # Extract relevant variables from ACONC for the current time step
+        pm25 = ds_apmdiag["PM25"].isel(TSTEP=t).values
+        pm10 = ds_apmdiag["PM10"].isel(TSTEP=t).values
+        # Append the PM2.5 values for this time step to the list
+        pm25_all_days.append(pm25)
+        pm10_all_days.append(pm10)
+
+    # Convert the list to a numpy array and stack it as a dataset
+    pm25_all_days = np.stack(pm25_all_days, axis=0)  # Shape (TSTEP, LAY, ROW, COL)
+    pm10_all_days = np.stack(pm10_all_days, axis=0)  # Shape (TSTEP, LAY, ROW, COL)
+
+    return pm25_all_days, pm10_all_days
+
+def compute_pm25_from_aconc_apmdiag_for_all_days(ds_aconc, ds_apmdiag):
+    """Compute PM2.5 for all days using the formula and available data."""
+    # Initialize an array to store PM2.5 for all days
+    pm25_all_days = []
+
+    # Loop through all time steps (TSTEP)
+    for t in range(ds_aconc.sizes['TSTEP']):
+        # Extract relevant variables from ACONC for the current time step
+        aso4i = ds_aconc["ASO4I"].isel(TSTEP=t).values
+        ano3i = ds_aconc["ANO3I"].isel(TSTEP=t).values
+        anh4i = ds_aconc["ANH4I"].isel(TSTEP=t).values
+        # More variables (add the ones in your formula)
+        anai = ds_aconc["ANAI"].isel(TSTEP=t).values
+        acli = ds_aconc["ACLI"].isel(TSTEP=t).values
+        aeci = ds_aconc["AECI"].isel(TSTEP=t).values
+        alvoo1i = ds_aconc["ALVOO1I"].isel(TSTEP=t).values
+        alvoo2i = ds_aconc["ALVOO2I"].isel(TSTEP=t).values
+        asvoo1i = ds_aconc["ASVOO1I"].isel(TSTEP=t).values
+        asvoo2i = ds_aconc["ASVOO2I"].isel(TSTEP=t).values
+        alvpo1i = ds_aconc["ALVPO1I"].isel(TSTEP=t).values
+        asvpo1i = ds_aconc["ASVPO1I"].isel(TSTEP=t).values
+        asvpo2i = ds_aconc["ASVPO2I"].isel(TSTEP=t).values
+        aothri = ds_aconc["AOTHRI"].isel(TSTEP=t).values
+        aothri = ds_aconc["AOTHRI"].isel(TSTEP=t).values
+
+        aso4j = ds_aconc["ASO4J"].isel(TSTEP=t).values
+        ano3j = ds_aconc["ANO3J"].isel(TSTEP=t).values
+        anh4j = ds_aconc["ANH4J"].isel(TSTEP=t).values
+        anaj = ds_aconc["ANAJ"].isel(TSTEP=t).values
+        aclj = ds_aconc["ACLJ"].isel(TSTEP=t).values
+        aecj = ds_aconc["AECJ"].isel(TSTEP=t).values
+        #axyl1j = ds_aconc["AXYL1J"].isel(TSTEP=t).values
+        #axyl2j = ds_aconc["AXYL2J"].isel(TSTEP=t).values
+        #axyl3j = ds_aconc["AXYL3J"].isel(TSTEP=t).values
+        #atol1j = ds_aconc["ATOL1J"].isel(TSTEP=t).values
+        #atol2j = ds_aconc["ATOL2J"].isel(TSTEP=t).values
+        #atol3j = ds_aconc["ATOL3J"].isel(TSTEP=t).values
+        #abnz1j = ds_aconc["ABNZ1J"].isel(TSTEP=t).values
+        #abnz2j = ds_aconc["ABNZ2J"].isel(TSTEP=t).values
+        #abnz3j = ds_aconc["ABNZ3J"].isel(TSTEP=t).values
+        aiso1j = ds_aconc["AISO1J"].isel(TSTEP=t).values
+        aiso2j = ds_aconc["AISO2J"].isel(TSTEP=t).values
+        aiso3j = ds_aconc["AISO3J"].isel(TSTEP=t).values
+        #atrp1j = ds_aconc["ATRP1J"].isel(TSTEP=t).values
+        #atrp2j = ds_aconc["ATRP2J"].isel(TSTEP=t).values
+        #atrp3j = ds_aconc["ATRP3J"].isel(TSTEP=t).values
+        #aalk1j = ds_aconc["AALK1J"].isel(TSTEP=t).values
+        #aalk2j = ds_aconc["AALK2J"].isel(TSTEP=t).values
+        #apah1j = ds_aconc["APAH1J"].isel(TSTEP=t).values
+        #apah2j = ds_aconc["APAH2J"].isel(TSTEP=t).values
+        #apah3j = ds_aconc["APAH3J"].isel(TSTEP=t).values
+        aorgcj = ds_aconc["AORGCJ"].isel(TSTEP=t).values
+        aolgbj = ds_aconc["AOLGBJ"].isel(TSTEP=t).values
+        aolgaj = ds_aconc["AOLGAJ"].isel(TSTEP=t).values
+        alvoo1j = ds_aconc["ALVOO1J"].isel(TSTEP=t).values
+        alvoo2j = ds_aconc["ALVOO2J"].isel(TSTEP=t).values
+        asvoo1j = ds_aconc["ASVOO1J"].isel(TSTEP=t).values
+        asvoo2j = ds_aconc["ASVOO2J"].isel(TSTEP=t).values
+        asvoo3j = ds_aconc["ASVOO3J"].isel(TSTEP=t).values
+        apcsoj = ds_aconc["APCSOJ"].isel(TSTEP=t).values
+        alvpo1j = ds_aconc["ALVPO1J"].isel(TSTEP=t).values
+        asvpo1j = ds_aconc["ASVPO1J"].isel(TSTEP=t).values
+        asvpo2j = ds_aconc["ASVPO2J"].isel(TSTEP=t).values
+        asvpo3j = ds_aconc["ASVPO3J"].isel(TSTEP=t).values
+        aivpo1j = ds_aconc["AIVPO1J"].isel(TSTEP=t).values
+        aothrj = ds_aconc["AOTHRJ"].isel(TSTEP=t).values
+        afej = ds_aconc["AFEJ"].isel(TSTEP=t).values
+        asij = ds_aconc["ASIJ"].isel(TSTEP=t).values
+        atij = ds_aconc["ATIJ"].isel(TSTEP=t).values
+        acij = ds_aconc["ACAJ"].isel(TSTEP=t).values
+        amgj = ds_aconc["AMGJ"].isel(TSTEP=t).values
+        amnj = ds_aconc["AMNJ"].isel(TSTEP=t).values
+        aalj = ds_aconc["AALJ"].isel(TSTEP=t).values
+        akj = ds_aconc["AKJ"].isel(TSTEP=t).values
+
+        asoil = ds_aconc["ASOIL"].isel(TSTEP=t).values
+        acors = ds_aconc["ACORS"].isel(TSTEP=t).values
+        aseacat = ds_aconc["ASEACAT"].isel(TSTEP=t).values
+        aclk = ds_aconc["ACLK"].isel(TSTEP=t).values
+        aso4k = ds_aconc["ASO4K"].isel(TSTEP=t).values
+        ano3k = ds_aconc["ANO3K"].isel(TSTEP=t).values
+        anh4k = ds_aconc["ANH4K"].isel(TSTEP=t).values
+        
+        # Extract PM2.5 fractions from APMDIAG for the current time step
+        pm25at = ds_apmdiag["PM25AT"].isel(TSTEP=t).values
+        pm25ac = ds_apmdiag["PM25AC"].isel(TSTEP=t).values
+        pm25co = ds_apmdiag["PM25CO"].isel(TSTEP=t).values
+        
+        # Calculate PM2.5 for the current time step using the formula
+        pm25 = (aso4i + ano3i + anh4i + anai + acli + aeci + alvoo1i + alvoo2i + asvoo1i + asvoo2i + alvpo1i + asvpo1i + asvpo2i + aothri) * pm25at + (aso4j + ano3j + anh4j + anaj + aclj + aecj +  aiso1j + aiso2j + aiso3j + aorgcj + aolgbj + aolgaj + alvoo1j + alvoo2j + asvoo1j + asvoo2j + asvoo3j + apcsoj + alvpo1j + asvpo1j + asvpo2j + asvpo3j + aivpo1j + aothrj + afej + asij + atij + acij + amgj + amnj + aalj + akj) * pm25ac + (asoil + acors + aseacat + aclk + aso4k + ano3k + anh4k) * pm25co
+        
+        # Append the PM2.5 values for this time step to the list
+        pm25_all_days.append(pm25)
+
+    # Convert the list to a numpy array and stack it as a dataset
+    pm25_all_days = np.stack(pm25_all_days, axis=0)  # Shape (TSTEP, LAY, ROW, COL)
+
+    return pm25_all_days
+
+
+# Adjust the step size for plotting wind vector density based on domain size (nx, ny)
+def calculate_step_size(nx, ny):
+    # Simple logic to reduce step size for smaller grids
+    if nx < 185 and ny < 250:
+        return 20  # Increase step size (fewer arrows) for smaller domains
+    elif nx < 200 and ny < 350:
+        return 30  # A moderate step for mid-sized domains
+    else:
+        return 40  # Default step for larger domains like d01
+
 def plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind, nx, ny):
     data = ds[variable].isel(TSTEP=time_index, LAY=0)
+    ############
     fig, ax = plt.subplots(figsize=(8, 6), subplot_kw={'projection': ccrs.PlateCarree()})
     mesh = ax.pcolormesh(lon2d, lat2d, data.values, transform=ccrs.PlateCarree(), cmap='viridis', shading='auto', zorder=1)
     plt.colorbar(mesh, ax=ax, label=ds[variable].units)
@@ -213,6 +381,8 @@ def plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds,
             vv = wrf_sel["VV"].isel(num_metgrid_levels=0).values
 
             # Unstagger U and trim or interpolate to match CMAQ grid
+            #u_unstaggered = 0.5 * (uu[:, :-1] + uu[:, 1:])
+            #v_unstaggered = 0.5 * (vv[:-1, :] + vv[1:, :])
             u_unstaggered = 0.5 * (uu[:, :-1] + uu[:, 1:])
             v_unstaggered = 0.5 * (vv[:-1, :] + vv[1:, :])
 
@@ -222,7 +392,6 @@ def plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds,
 
             # If the WRF grid is smaller than CMAQ, we need to interpolate
             if u_trimmed.shape != (ny, nx):
-                # Resize to the target grid size (nx, ny)
                 from scipy.interpolate import interp2d
                 f_u = interp2d(np.arange(u_unstaggered.shape[1]), np.arange(u_unstaggered.shape[0]), u_unstaggered)
                 f_v = interp2d(np.arange(v_unstaggered.shape[1]), np.arange(v_unstaggered.shape[0]), v_unstaggered)
@@ -230,14 +399,15 @@ def plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds,
                 v_trimmed = f_v(np.linspace(0, v_unstaggered.shape[1] - 1, nx), np.linspace(0, v_unstaggered.shape[0] - 1, ny))
 
             # Generate lat/lon grid from GRIDDESC (use the previously calculated lon2d, lat2d)
-            step = 4  # Adjust arrow density on the plot
+            #step = calculate_step_size(nx, ny)  # Calculate the step based on grid size
+            step = max(1, calculate_step_size(nx, ny) // 2)
             ax.quiver(
                 lon2d[::step, ::step],
                 lat2d[::step, ::step],
                 u_trimmed[::step, ::step],
                 v_trimmed[::step, ::step],
                 transform=ccrs.PlateCarree(),
-                scale=50,
+                scale=100,
                 width=0.002,
                 color="white",
                 alpha=0.7,
@@ -254,86 +424,6 @@ def plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds,
     gl.right_labels = False
     ax.set_title(f"{variable} + Wind Vectors at {cmaq_time}")
     return fig
-
-#def plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind):
-#    data = ds[variable].isel(TSTEP=time_index, LAY=0)
-#    fig, ax = plt.subplots(figsize=(8, 6), subplot_kw={'projection': ccrs.PlateCarree()})
-#    mesh = ax.pcolormesh(lon2d, lat2d, data.values, transform=ccrs.PlateCarree(), cmap='viridis', shading='auto', zorder=1)
-#    plt.colorbar(mesh, ax=ax, label=ds[variable].units)
-
-#    if show_wind:
-#        try:
-#            wrf_times_raw = wrf_ds['Times'].values
-#            wrf_times = pd.to_datetime(["".join(t.astype(str)).replace("_", " ").strip() for t in wrf_times_raw])
-#            wrf_time_idx = np.argmin(np.abs(wrf_times - pd.to_datetime(cmaq_time)))
-#            wrf_sel = wrf_ds.isel(Time=wrf_time_idx).load()
-
-#            uu = wrf_sel["UU"].isel(num_metgrid_levels=0).values
-#            vv = wrf_sel["VV"].isel(num_metgrid_levels=0).values
-
-#            # Unstagger U and trim to 88x88
-#            u_unstaggered = 0.5 * (uu[:, :-1] + uu[:, 1:])
-#            v_unstaggered = 0.5 * (vv[:-1, :] + vv[1:, :])
-
-#            # Trim or crop to match the 88x88 CMAQ grid
-#            u = u_unstaggered[:88, :88]
-#            v = v_unstaggered[:88, :88]
-
-#            # Generate lat/lon grid from GRIDDESC
-#            # You already have:
-#            # lon2d, lat2d = generate_latlon_grid_from_griddesc()
-
-#            step = 4
-#            ax.quiver(
-#                lon2d[::step, ::step],
-#                lat2d[::step, ::step],
-#                u[::step, ::step],
-#                v[::step, ::step],
-#                transform=ccrs.PlateCarree(),
-#                scale=50,
-#                width=0.002,
-#                color="white",
-#                alpha=0.7,
-#                zorder=2
-#            )
-
-#        except Exception as e:
-#            st.warning(f"Could not overlay wind vectors: {e}")
-
-#    ax.coastlines()
-#    ax.add_feature(cfeature.BORDERS, linestyle=':')
-#    gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.7, linestyle='--')
-#    gl.top_labels = False
-#    gl.right_labels = False
-#    ax.set_title(f"{variable} + Wind Vectors at {cmaq_time}")
-#    return fig
-
-
-# --- Streamlit app ---
-st.set_page_config(layout="wide")
-st.title("CMAQ Concentration Viewer with Time Series")
-
-# --- Sidebar ---
-st.sidebar.header("Configuration")
-
-# Domain selection
-domain = st.sidebar.selectbox("Select CMAQ Domain", ["d01", "d02", "d03"])
-
-# Paths
-cmaq_base = st.sidebar.text_input(
-    "Path to CMAQ base directory of daily NetCDF files:",
-    "/home/duch/cmaq/khaliaforecast/20240207_M200/esme_local/forecast/run/CTM"
-)
-
-mcip_base = st.sidebar.text_input(
-    "Path to MCIP base directory:",
-    "/home/duch/cmaq/khaliaforecast/20240207_M200/esme_local/forecast/run/MCIP"
-)
-
-wrf_base = st.sidebar.text_input(
-    "Path to WRF meteorological base directory:",
-    "/home/duch/cmaq/khaliaforecast/20240207_M200/esme_local/forecast/run/WRF/run"
-)
 
 # --- Helper: Read GRIDDESC ---
 import re
@@ -381,10 +471,11 @@ def read_griddesc(griddesc_file):
 
     return None
 
+
 # --- Find GRIDDESC file for chosen domain ---
-date_dirs = sorted(glob.glob(os.path.join(mcip_base, "2024-*")))
+date_dirs = sorted(glob.glob(os.path.join(mcip_base, "2013-*")))
 if not date_dirs:
-    st.error(f"No date directories found in {mcip_base}")
+    print(f"No date directories found in {mcip_base}")
 else:
     # Pick first date folder
     first_date = date_dirs[0]
@@ -392,26 +483,26 @@ else:
     if os.path.exists(griddesc_file):
         grid_info = read_griddesc(griddesc_file)
         if grid_info:
-            st.sidebar.write(f"Grid resolution: {grid_info['xcell']/1000:.1f} km")
-            st.sidebar.write(f"Grid size: {grid_info['nx']} x {grid_info['ny']}")
+            print(f"Grid resolution: {grid_info['xcell']/1000:.1f} km")
+            print(f"Grid size: {grid_info['nx']} x {grid_info['ny']}")
         else:
-            st.error(f"Could not parse grid info from {griddesc_file}")
+            print(f"Could not parse grid info from {griddesc_file}")
     else:
-        st.error(f"GRIDDESC not found: {griddesc_file}")
+        print(f"GRIDDESC not found: {griddesc_file}")
 
 # --- File discovery ---
 if os.path.exists(cmaq_base):
     file_list = sorted(glob.glob(
-        os.path.join(cmaq_base, f"2024-*/{domain}/CCTM_ACONC_v532_intel_{domain}_*.nc")
+        os.path.join(cmaq_base, f"2013-07-2*/{domain}/CCTM_ACONC_v54_intel_{domain}_*.nc")
     ))
-    st.sidebar.write(f"Found {len(file_list)} CMAQ files.")
+    print(f"Found {len(file_list)} CMAQ files.")
 
     wrf_files = sorted(glob.glob(
-        os.path.join(wrf_base, f"met_em.{domain}.*.nc")
+        os.path.join(wrf_base, f"met_em.{domain}.2013-07-2[0-5]*nc")
     ))
-    st.sidebar.write(f"Found {len(wrf_files)} WRF files.")
+    print(f"Found {len(wrf_files)} WRF files.")
 else:
-    st.warning("Please check your CMAQ base directory path.")
+    print("Please check your CMAQ base directory path.")
 
 # Now you can continue your existing code using `file_list` and `wrf_files`
 
@@ -439,12 +530,101 @@ if file_list:
             concat_dim="TSTEP",
             #engine="netcdf4",
             parallel=True
-        )
+        ).isel(LAY=[0])
 
-        st.sidebar.success("CMAQ file loaded.")
+        print("CMAQ file loaded.")
 
-        variables = [v for v in ds.data_vars if v != "TFLAG"]
-        variable = st.sidebar.selectbox("Select variable", variables)
+        # --- Sidebar for variable selection ---
+        variables = [v for v in ds.data_vars if v != "TFLAG"] + ['PM2.5'] + ["PM10"]  # Add PM2.5 as an option
+        variable = "PM2.5"
+
+        if variable.lower() in ("pm2.5", "pm25", "pm_2_5", "pm10"):
+            # Find all ACONC and AELMO files
+            all_aconc_files = file_list if file_list else None
+            all_apm_files = []
+
+            for aconc_file in all_aconc_files:
+                # Find the corresponding AELMO file for each ACONC file
+                apm_file = find_apmdiag_for_aconc(aconc_file)
+                if apm_file and os.path.exists(apm_file):
+                    all_apm_files.append(apm_file)
+                else:
+                    printf(f"AELMO file not found for {aconc_file}; cannot compute PM2.5.")
+
+            if not all_apm_files:
+                print("No valid AELMO files found for the given ACONC files.")
+            else:
+                # Debugging: Show the paths of the AELMO files
+                print(f"Found AELMO files: {all_apm_files}")
+        
+                # Load and process AELMO files
+                ds_apmdiag_list = []
+                for apm_file in all_apm_files:
+                    ds_apmdiag_list.append(xr.open_dataset(apm_file))
+
+                # Now calculate PM2.5 for all days from all ACONC and AELMO datasets
+                pm25_all_days = []
+                pm10_all_days = []
+
+                for t in range(len(all_aconc_files)):  # Iterate over all time steps (4 days)
+                    ds_aconc = xr.open_dataset(all_aconc_files[t]).isel(LAY=[0])
+                    # Select only the first layer (LAY=0)
+                    # Compute PM2.5 using ACONC and AELMO data
+                    ds_apmdiag = ds_apmdiag_list[t]  # Select the corresponding AELMO dataset
+                    pm25_day, pm10_day = compute_pm25_from_aelmo_for_all_days(ds_apmdiag)
+
+                    pm25_all_days.append(pm25_day)
+                    pm10_all_days.append(pm10_day)
+
+                # Stack the PM2.5 data for all days (96 hours total)
+                pm25_all_days = np.stack(pm25_all_days, axis=0)
+                pm10_all_days = np.stack(pm10_all_days, axis=0)
+                print(pm25_all_days.shape)
+
+                # Get the number of files (days)
+                num_files = len(file_list)
+                num_time_steps = 24 * num_files  # Total time steps (24 hours per day * number of files)
+
+                # Extract the necessary dimensions (nz, nx, ny)
+                nz, nx, ny = pm25_all_days.shape[2], pm25_all_days.shape[3], pm25_all_days.shape[4]
+
+                # Reshape the pm25_all_days array to match the new time steps
+                pm25_reshaped = pm25_all_days.reshape(num_time_steps, nz, nx, ny)
+                pm10_reshaped = pm10_all_days.reshape(num_time_steps, nz, nx, ny)
+
+                # Create a new TSTEP coordinate for the reshaped PM2.5 data (it should have 96 time steps)
+                tstep_values = np.arange(num_time_steps)  # Create an array of length num_time_steps (96 for 4 days)
+
+                # Create a new DataArray for PM2.5 with the reshaped data
+                pm25_data_array = xr.DataArray(
+                    pm25_reshaped,
+                    dims=("TSTEP", "LAY", "ROW", "COL"),
+                    coords={
+                        "TSTEP": tstep_values,  # Use the new TSTEP coordinate
+                        "LAY": ds_aconc["LAY"].values,  # Assuming 'LAY' exists in your ACONC dataset
+                        "ROW": ds_aconc["ROW"].values,  # Assuming 'ROW' exists in your ACONC dataset
+                        "COL": ds_aconc["COL"].values,  # Assuming 'COL' exists in your ACONC dataset
+                    },
+                    attrs={"long_name": "PM2.5", "units": "µg/m³"}
+                )
+
+                pm10_data_array = xr.DataArray(
+                    pm10_reshaped,
+                    dims=("TSTEP", "LAY", "ROW", "COL"),
+                    coords={
+                        "TSTEP": tstep_values,  # Use the new TSTEP coordinate
+                        "LAY": ds_aconc["LAY"].values,  # Assuming 'LAY' exists in your ACONC dataset
+                        "ROW": ds_aconc["ROW"].values,  # Assuming 'ROW' exists in your ACONC dataset
+                        "COL": ds_aconc["COL"].values,  # Assuming 'COL' exists in your ACONC dataset
+                    },
+                    attrs={"long_name": "PM10", "units": "µg/m³"}
+                )
+
+                # Add the PM2.5 DataArray to the dataset
+                ds["PM2.5"] = pm25_data_array
+                ds["PM10"] = pm25_data_array
+
+                # Now PM2.5 is part of the dataset, and you should be able to select it without any dimension errors
 
         tflag = ds["TFLAG"].values[:, 0, :]
         times = []
@@ -458,10 +638,6 @@ if file_list:
             dt = pd.Timestamp(f"{year}-01-01") + pd.Timedelta(days=doy - 1, hours=hour, minutes=minute, seconds=second)
             times.append(dt)
 
-        # In the Streamlit sidebar
-        show_wind = st.sidebar.checkbox("Show Wind Overlay", value=True)
-        animate = st.sidebar.checkbox("Play Animation")
-
         # Generate lon/lat grid once
         #lon2d, lat2d = generate_latlon_grid_from_griddesc(griddesc_file, "WRFtestCMAQ")
         #griddesc_file = "/home/duch/cmaq/khaliaforecast/20240207_M200/esme_local/forecast/run/MCIP/2024-02-07/d01/GRIDDESC"
@@ -470,71 +646,74 @@ if file_list:
         griddesc_file = os.path.join(first_date, domain, "GRIDDESC")
         lon2d, lat2d, grid_info = generate_latlon_grid_from_griddesc(griddesc_file)
 
-        st.sidebar.write(f"Grid resolution: {grid_info['xcell']/1000:.1f} km")
-        st.sidebar.write(f"Grid size: {grid_info['nx']} x {grid_info['ny']}")
+        #st.sidebar.write(f"Grid resolution: {grid_info['xcell']/1000:.1f} km")
+        #st.sidebar.write(f"Grid size: {grid_info['nx']} x {grid_info['ny']}")
 
         print(f"Grid resolution: {grid_info['xcell']/1000:.1f} km")
         print(f"Grid size: {grid_info['nx']} x {grid_info['ny']}")
 
         # Load WRF files once for animation or static
-        wrf_files = sorted(glob.glob(os.path.join(wrf_base, f"met_em.{domain}.*.nc")))
+        wrf_files = sorted(glob.glob(os.path.join(wrf_base, f"met_em.{domain}.2013-07-2[0-5]*nc")))
         #wrf_ds = xr.open_mfdataset(wrf_files, combine='nested', concat_dim="Time", engine="netcdf4")
         #wrf_ds = xr.open_mfdataset(wrf_files, combine='nested', concat_dim="Time", engine="pseudonetcdf")
         wrf_ds = xr.open_mfdataset(wrf_files, combine='nested', concat_dim="Time")
 
-        # Animation mode
-        import os
-        import imageio
-        from io import BytesIO
-
-        # New UI: Add record option
-        record = st.sidebar.checkbox("Record Animation to MP4")
+        show_wind = False
+        animate = False
+        if show_wind:
+            # Assuming `times` is a list or array of time indices
+            for time_index, cmaq_time in enumerate(times):
+                # Generate the figure for each time step
+                fig = plot_concentration_with_wind(
+                    ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind=True, nx=grid_info["nx"], ny=grid_info["ny"]
+                )
+                # Display the plot for each time step
+                plt.title(f"Wind Field at Time: {cmaq_time}")
+                plt.show()
+                # Optionally, you can save the plots as images (if you don't want to display them interactively)
+                # fig.savefig(f"wind_field_{cmaq_time}.png")
+                print(f"Plot for time: {cmaq_time} displayed.")
 
         if animate:
-            placeholder = st.empty()
-            frames = []  # store images for video
-            for time_index in range(len(times)):
+            import matplotlib.animation as animation
+            # Create the figure and axis
+            fig, ax = plt.subplots()
+            # Function to update the plot for each time step (frame)
+            def update_plot(frame):
+                ax.clear()  # Clear the current axes
+    
+                # Get the current time index and time step
+                time_index = frame
                 cmaq_time = times[time_index]
-                with placeholder.container():
-                    #fig = plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind)
-                    # Plot concentration with wind
-                    fig = plot_concentration_with_wind(
-                        ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind=True, nx=grid_info["nx"], ny=grid_info["ny"]
-                    )
+    
+                # Call the function to plot the concentration with wind at this time step
+                plot_concentration_with_wind(
+                    ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind=True, nx=grid_info["nx"], ny=grid_info["ny"]
+                )
+    
+                # Set title with the current time step
+                ax.set_title(f"Wind Field at Time: {cmaq_time}")
+    
+                # Optionally, you can adjust the axis limits to match the data range
+                ax.set_xlim(lon2d.min(), lon2d.max())
+                ax.set_ylim(lat2d.min(), lat2d.max())
+    
+                # Return the updated plot elements
+                return ax,
 
-                    st.pyplot(fig)
-
-                    if record:
-                        buf = BytesIO()
-                        fig.savefig(buf, format='png', dpi=150)
-                        buf.seek(0)
-                        frames.append(imageio.v3.imread(buf.getvalue()))
-                time.sleep(0.5)  # Controls speed
-            # Save video
-            if record and frames:
-                output_path = "/tmp/cmaq_animation.mp4"
-                imageio.mimsave(output_path, frames, fps=2)
-                with open(output_path, "rb") as f:
-                    st.download_button("🎥 Download MP4", f, file_name="cmaq_animation.mp4")
-
-
-        else:
-            time_index = st.sidebar.slider("Select time index", 0, len(times) - 1, 0)
-            cmaq_time = times[time_index]
-            # fig = plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind)
-            fig = plot_concentration_with_wind(
-                ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind=True, nx=grid_info["nx"], ny=grid_info["ny"]
+            # Create the animation
+            ani = animation.FuncAnimation(
+                fig,            # Figure to animate
+                update_plot,    # Update function for each frame
+                frames=len(times),  # Number of frames (one for each time step)
+                interval=500,   # Time between frames (in ms)
+                blit=False,     # Set to False if you want to redraw everything each time
             )
-            st.pyplot(fig)
 
-        st.sidebar.write(f"Selected time: {times[time_index]}")
+            # Display the animation
+            plt.show()
 
-        # --- Folium map for interaction ---
-        st.subheader("Click on the map to see time series")
-        center_lat = np.mean(lat2d)
-        center_lon = np.mean(lon2d)
-        fmap = folium.Map(location=[center_lat, center_lon], zoom_start=7)
-
+        # Validation and metics
         stations = [
             {"name": "PARRAMATTA NORTH", "lat": -33.797, "lon": 151.002},
             {"name": "RICHMOND", "lat": -33.60, "lon": 150.7514},
@@ -551,46 +730,6 @@ if file_list:
             {"name": "WOLLONGONG", "lat": -34.424, "lon": 150.893}
         ]
 
-        for station in stations:
-            folium.Marker(
-                location=[station["lat"], station["lon"]],
-                popup=station["name"],
-                icon=folium.Icon(color="blue", icon="cloud"),
-            ).add_to(fmap)
-
-        # Display map
-        output = st_folium(fmap, height=400, width=700)
-
-        # --- Time Series on Click ---
-        if output and output.get("last_clicked"):
-            click_lat = output["last_clicked"]["lat"]
-            click_lon = output["last_clicked"]["lng"]
-
-            st.info(f"Clicked at lat={click_lat:.3f}, lon={click_lon:.3f}")
-
-            # Find nearest grid point
-            flat_lats = lat2d.flatten()
-            flat_lons = lon2d.flatten()
-            distances = np.sqrt((flat_lats - click_lat)**2 + (flat_lons - click_lon)**2)
-            idx = np.argmin(distances)
-            ny, nx = lat2d.shape
-            i, j = np.unravel_index(idx, (ny, nx))
-
-            st.write(f"Nearest grid index: ({i}, {j})")
-
-            # Extract time series
-            series = ds[variable][:, 0, i, j].values
-            df_ts = pd.DataFrame({'Time': times, variable: series})
-
-            # Plot time series
-            fig2, ax2 = plt.subplots()
-            ax2.plot(df_ts['Time'], df_ts[variable], label=f"{variable} at ({i},{j})")
-            ax2.set_xlabel("Time")
-            ax2.set_ylabel(f"{variable} ({ds[variable].units})")
-            ax2.set_title(f"Time Series at lat={click_lat:.2f}, lon={click_lon:.2f}")
-            ax2.grid(True)
-            st.pyplot(fig2)
-
         # This section is for validation with observed data from API
         # Station and pollutant parameter are selected from the lists on sideboard.
         # The date is also selected from sideboard
@@ -599,25 +738,25 @@ if file_list:
         # Mapping model parameter names to API parameter names
         PARAMETER_API_MAP = {
             "O3": "OZONE",
-            "PM2.5": "PM25",
+            "PM2.5": "PM2.5",
             "PM10": "PM10",
             "NO2": "NO2",
             # Add more if needed
         }
 
         # --- Validation Section ---
-        st.subheader("📡 Model vs Observation Validation")
+        print("📡 Model vs Observation Validation")
 
         # Sidebar selections
-        station_name = st.sidebar.selectbox("Select Station for Validation", [s["name"] for s in stations])
-        parameter_code = st.sidebar.selectbox("Select Parameter", ["NO2", "O3", "PM10", "PM2.5"])  # Customize as needed
+        station_name = "LIVERPOOL"
+        parameter_code = "PM2.5"  # Customize as needed
         # Use available model time as fallback for initial range
         #default_start = pd.to_datetime(times.min())
         #default_end = pd.to_datetime(times.max())
         default_start = min(times)
         default_end = max(times)
 
-        date_range = st.sidebar.date_input("Select Date Range", [default_start, default_end])
+        date_range = [default_start, default_end]
 
         # Find station info by name
         station_info = next((s for s in stations if s["name"] == station_name), None)
@@ -668,12 +807,15 @@ if file_list:
             df_obs.index.name = "datetime_local"
 
             # Merge and convert observed units from pphm to ppm if needed
-            df_merged = pd.merge(df_pred, df_obs / 100, left_index=True, right_index=True, how='inner')
+            if parameter_code.lower() in ("pm2.5", "pm25", "pm_2_5", "pm-2.5"):
+                df_merged = pd.merge(df_pred, df_obs, left_index=True, right_index=True, how='inner')
+            else:
+                df_merged = pd.merge(df_pred, df_obs / 100, left_index=True, right_index=True, how='inner')
 
             print(f"Observed shape: {df_obs.shape}, Predicted shape: {df_pred.shape}")
 
             if not df_merged.empty:
-                st.markdown(f"### 📊 Comparison at **{station_name}**")
+                print(f"### 📊 Comparison at **{station_name}**")
 
                 fig3, ax3 = plt.subplots()
                 ax3.plot(df_merged.index, df_merged["pred"], label="CMAQ Prediction")
@@ -683,21 +825,39 @@ if file_list:
                 ax3.set_xlabel("Time")
                 ax3.grid(True)
                 ax3.legend()
-                st.pyplot(fig3)
+                plt.show()
 
                 # --- Compute validation metrics ---
-                st.line_chart(df_merged.rename(columns={"pred": "Model", "obs": "Observed"}))
+                #st.line_chart(df_merged.rename(columns={"pred": "Model", "obs": "Observed"}))
+
+                # Assuming df_merged is a pandas DataFrame
+                df_merged = df_merged.rename(columns={"pred": "Model", "obs": "Observed"})
+
+                # Plot using Matplotlib
+                plt.plot(df_merged.index, df_merged['Model'], label='Model', color='blue')
+                plt.plot(df_merged.index, df_merged['Observed'], label='Observed', color='red')
+
+                # Add labels and title
+                plt.xlabel('Time')
+                plt.ylabel('Value')
+                plt.title('Model vs Observed')
+
+                # Show the legend
+                plt.legend()
+
+                # Display the plot
+                plt.show()
 
                 from sklearn.metrics import mean_squared_error
-                rmse = mean_squared_error(df_merged["obs"], df_merged["pred"], squared=False)
-                st.metric("RMSE", f"{rmse:.3f} ppm")
+                rmse = mean_squared_error(df_merged["Observed"], df_merged["Model"], squared=False)
+                print("RMSE", f"{rmse:.3f} ppm")
 
                 metrics = compute_metrics(df_merged)
-                st.markdown("### 📈 Validation Metrics")
-                st.write(metrics)
+                print("### 📈 Validation Metrics")
+                print(metrics)
             else:
-                st.warning("No matching time data found between prediction and observation.")
+                print("No matching time data found between prediction and observation.")
 
     except Exception as e:
-        st.error(f"Failed to load or plot file: {e}")
+        print(f"Failed to load or plot file: {e}")
 

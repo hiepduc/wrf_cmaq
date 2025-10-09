@@ -196,8 +196,113 @@ def generate_latlon_grid_from_griddesc(griddesc_file):
 
     return lon2d, lat2d, grid_info
 
+import fnmatch
+import os
+
+import fnmatch
+import os
+
+def find_apmdiag_for_aconc(aconc_path):
+    """Given path to a CCTM_ACONC file or to a directory containing them,
+    try to find the corresponding CCT_APMDIAG* file in the same directory."""
+    
+    if os.path.isdir(aconc_path):
+        base_dir = aconc_path
+    else:
+        base_dir = os.path.dirname(aconc_path)
+    
+    # Debugging: Print the directory we are searching
+    print(f"Looking for APMDIAG in: {base_dir}")
+    
+    # Look for files named like CCT_APMDIAG*.nc in that directory
+    for fname in sorted(os.listdir(base_dir)):
+        print(f"Checking file: {fname}")  # Debugging: Print file names found in the directory
+        if fname.startswith("CCTM_APMDIAG"):  # Match the prefix directly
+            print(f"Found APMDIAG file: {fname}")  # Debugging: Found the correct file
+            return os.path.join(base_dir, fname)
+    
+    # Debugging: If no file is found
+    print("APMDIAG file not found!")
+    return None
+
+
+def compute_pm25_from_aconc_apmdiag(ds_ac, ds_apmdiag, time_index=0, lay=0):
+    """
+    Compute PM2.5 concentration from ACONC (species concentrations) and APMDIAG (PM2.5 fractions).
+    Returns PM2.5 as a 2D numpy array.
+    """
+    # Groups for PM2.5 calculation (you may need to adjust if there are other variables)
+    AT_species = [
+        "ASO4I", "ANO3I", "ANH4I", "ANAI", "ACLI", "AECI", "ALVOO1I", "ALVOO2I",
+        "ASVOO1I", "ASVOO2I", "ALVPO1I", "ASVPO1I", "ASVPO2I", "AOTHRI"
+    ]
+    AC_species = [
+        "ASO4J", "ANO3J", "ANH4J", "ANAJ", "ACLJ", "AECJ", "AXYL1J", "AXYL2J",
+        "AXYL3J", "ATOL1J", "ATOL2J", "ATOL3J", "ABNZ1J", "ABNZ2J", "ABNZ3J",
+        "AISO1J", "AISO2J", "AISO3J", "ATRP1J", "ATRP2J", "ASQTJ", "AALK1J",
+        "AALK2J", "APAH1J", "APAH2J", "APAH3J", "AORGCJ", "AOLGBJ", "AOLGAJ",
+        "ALVOO1J", "ALVOO2J", "ASVOO1J", "ASVOO2J", "ASVOO3J", "APCSOJ", "ALVPO1J",
+        "ASVPO1J", "ASVPO2J", "ASVPO3J", "AIVPO1J", "AOTHRJ", "AFEJ", "ASIJ",
+        "ATIJ", "ACAJ", "AMGJ", "AMNJ", "AALJ", "AKJ"
+    ]
+    CO_species = ["ASOIL", "ACORS", "ASEACAT", "ACLK", "ASO4K", "ANO3K", "ANH4K"]
+
+    # Helper to fetch ACONC variable
+    def get_aconc_2d(token):
+        if token in ds_ac.variables:
+            return ds_ac[token].isel(TSTEP=time_index, LAY=lay).values
+        else:
+            return None
+
+    # Helper to fetch APMDIAG variable
+    def get_apm_frac(varname):
+        if varname in ds_apmdiag.variables:
+            return ds_apmdiag[varname].isel(TSTEP=time_index).values  # Ensure correct indexing here
+        else:
+            return None
+
+    # Sum and apply fractions for PM2.5 groups
+    at_sum = sum([get_aconc_2d(spec) for spec in AT_species if get_aconc_2d(spec) is not None])
+    ac_sum = sum([get_aconc_2d(spec) for spec in AC_species if get_aconc_2d(spec) is not None])
+    co_sum = sum([get_aconc_2d(spec) for spec in CO_species if get_aconc_2d(spec) is not None])
+
+    # Apply fractions from APMDIAG
+    pm25at_frac = get_apm_frac("PM25AT")
+    pm25ac_frac = get_apm_frac("PM25AC")
+    pm25co_frac = get_apm_frac("PM25CO")
+
+    # Calculate PM2.5
+    pm25 = None
+    if at_sum is not None and pm25at_frac is not None:
+        pm25 = at_sum * pm25at_frac
+    if ac_sum is not None and pm25ac_frac is not None:
+        pm25 += ac_sum * pm25ac_frac
+    if co_sum is not None and pm25co_frac is not None:
+        pm25 += co_sum * pm25co_frac
+
+    return pm25
+
+
+    # Helper to fetch ACONC variable
+    def get_aconc_2d(token):
+        if token in ds_ac.variables:
+            return ds_ac[token].isel(TSTEP=time_index, LAY=lay).values
+        else:
+            return None
+
+# Adjust the step size for plotting wind vector density based on domain size (nx, ny)
+def calculate_step_size(nx, ny):
+    # Simple logic to reduce step size for smaller grids
+    if nx < 400 and ny < 400:
+        return 16  # Increase step size (fewer arrows) for smaller domains
+    elif nx < 800 and ny < 800:
+        return 4  # A moderate step for mid-sized domains
+    else:
+        return 2  # Default step for larger domains like d03
+
 def plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind, nx, ny):
     data = ds[variable].isel(TSTEP=time_index, LAY=0)
+    ############
     fig, ax = plt.subplots(figsize=(8, 6), subplot_kw={'projection': ccrs.PlateCarree()})
     mesh = ax.pcolormesh(lon2d, lat2d, data.values, transform=ccrs.PlateCarree(), cmap='viridis', shading='auto', zorder=1)
     plt.colorbar(mesh, ax=ax, label=ds[variable].units)
@@ -222,7 +327,6 @@ def plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds,
 
             # If the WRF grid is smaller than CMAQ, we need to interpolate
             if u_trimmed.shape != (ny, nx):
-                # Resize to the target grid size (nx, ny)
                 from scipy.interpolate import interp2d
                 f_u = interp2d(np.arange(u_unstaggered.shape[1]), np.arange(u_unstaggered.shape[0]), u_unstaggered)
                 f_v = interp2d(np.arange(v_unstaggered.shape[1]), np.arange(v_unstaggered.shape[0]), v_unstaggered)
@@ -230,7 +334,7 @@ def plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds,
                 v_trimmed = f_v(np.linspace(0, v_unstaggered.shape[1] - 1, nx), np.linspace(0, v_unstaggered.shape[0] - 1, ny))
 
             # Generate lat/lon grid from GRIDDESC (use the previously calculated lon2d, lat2d)
-            step = 4  # Adjust arrow density on the plot
+            step = calculate_step_size(nx, ny)  # Calculate the step based on grid size
             ax.quiver(
                 lon2d[::step, ::step],
                 lat2d[::step, ::step],
@@ -254,86 +358,6 @@ def plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds,
     gl.right_labels = False
     ax.set_title(f"{variable} + Wind Vectors at {cmaq_time}")
     return fig
-
-#def plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind):
-#    data = ds[variable].isel(TSTEP=time_index, LAY=0)
-#    fig, ax = plt.subplots(figsize=(8, 6), subplot_kw={'projection': ccrs.PlateCarree()})
-#    mesh = ax.pcolormesh(lon2d, lat2d, data.values, transform=ccrs.PlateCarree(), cmap='viridis', shading='auto', zorder=1)
-#    plt.colorbar(mesh, ax=ax, label=ds[variable].units)
-
-#    if show_wind:
-#        try:
-#            wrf_times_raw = wrf_ds['Times'].values
-#            wrf_times = pd.to_datetime(["".join(t.astype(str)).replace("_", " ").strip() for t in wrf_times_raw])
-#            wrf_time_idx = np.argmin(np.abs(wrf_times - pd.to_datetime(cmaq_time)))
-#            wrf_sel = wrf_ds.isel(Time=wrf_time_idx).load()
-
-#            uu = wrf_sel["UU"].isel(num_metgrid_levels=0).values
-#            vv = wrf_sel["VV"].isel(num_metgrid_levels=0).values
-
-#            # Unstagger U and trim to 88x88
-#            u_unstaggered = 0.5 * (uu[:, :-1] + uu[:, 1:])
-#            v_unstaggered = 0.5 * (vv[:-1, :] + vv[1:, :])
-
-#            # Trim or crop to match the 88x88 CMAQ grid
-#            u = u_unstaggered[:88, :88]
-#            v = v_unstaggered[:88, :88]
-
-#            # Generate lat/lon grid from GRIDDESC
-#            # You already have:
-#            # lon2d, lat2d = generate_latlon_grid_from_griddesc()
-
-#            step = 4
-#            ax.quiver(
-#                lon2d[::step, ::step],
-#                lat2d[::step, ::step],
-#                u[::step, ::step],
-#                v[::step, ::step],
-#                transform=ccrs.PlateCarree(),
-#                scale=50,
-#                width=0.002,
-#                color="white",
-#                alpha=0.7,
-#                zorder=2
-#            )
-
-#        except Exception as e:
-#            st.warning(f"Could not overlay wind vectors: {e}")
-
-#    ax.coastlines()
-#    ax.add_feature(cfeature.BORDERS, linestyle=':')
-#    gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.7, linestyle='--')
-#    gl.top_labels = False
-#    gl.right_labels = False
-#    ax.set_title(f"{variable} + Wind Vectors at {cmaq_time}")
-#    return fig
-
-
-# --- Streamlit app ---
-st.set_page_config(layout="wide")
-st.title("CMAQ Concentration Viewer with Time Series")
-
-# --- Sidebar ---
-st.sidebar.header("Configuration")
-
-# Domain selection
-domain = st.sidebar.selectbox("Select CMAQ Domain", ["d01", "d02", "d03"])
-
-# Paths
-cmaq_base = st.sidebar.text_input(
-    "Path to CMAQ base directory of daily NetCDF files:",
-    "/home/duch/cmaq/khaliaforecast/20240207_M200/esme_local/forecast/run/CTM"
-)
-
-mcip_base = st.sidebar.text_input(
-    "Path to MCIP base directory:",
-    "/home/duch/cmaq/khaliaforecast/20240207_M200/esme_local/forecast/run/MCIP"
-)
-
-wrf_base = st.sidebar.text_input(
-    "Path to WRF meteorological base directory:",
-    "/home/duch/cmaq/khaliaforecast/20240207_M200/esme_local/forecast/run/WRF/run"
-)
 
 # --- Helper: Read GRIDDESC ---
 import re
@@ -380,6 +404,33 @@ def read_griddesc(griddesc_file):
                 continue
 
     return None
+
+
+# --- Streamlit app ---
+st.set_page_config(layout="wide")
+st.title("CMAQ Concentration Viewer with Time Series")
+
+# --- Sidebar ---
+st.sidebar.header("Configuration")
+
+# Domain selection
+domain = st.sidebar.selectbox("Select CMAQ Domain", ["d01", "d02", "d03"])
+
+# Paths
+cmaq_base = st.sidebar.text_input(
+    "Path to CMAQ base directory of daily NetCDF files:",
+    "/home/duch/cmaq/khaliaforecast/20240207_M200/esme_local/forecast/run/CTM"
+)
+
+mcip_base = st.sidebar.text_input(
+    "Path to MCIP base directory:",
+    "/home/duch/cmaq/khaliaforecast/20240207_M200/esme_local/forecast/run/MCIP"
+)
+
+wrf_base = st.sidebar.text_input(
+    "Path to WRF meteorological base directory:",
+    "/home/duch/cmaq/khaliaforecast/20240207_M200/esme_local/forecast/run/WRF/run"
+)
 
 # --- Find GRIDDESC file for chosen domain ---
 date_dirs = sorted(glob.glob(os.path.join(mcip_base, "2024-*")))
@@ -443,8 +494,31 @@ if file_list:
 
         st.sidebar.success("CMAQ file loaded.")
 
-        variables = [v for v in ds.data_vars if v != "TFLAG"]
+        # --- Sidebar for variable selection ---
+        variables = [v for v in ds.data_vars if v != "TFLAG"] + ['PM2.5']  # Add PM2.5 as an option
         variable = st.sidebar.selectbox("Select variable", variables)
+
+        if variable.lower() in ("pm2.5", "pm25", "pm_2_5", "pm-2.5"):
+            # locate a representative ACONC file path (file_list contains daily files)
+            aconc_file = file_list[0] if file_list else None
+            apm_file = find_apmdiag_for_aconc(aconc_file) if aconc_file else None
+    
+            if apm_file is None or not os.path.exists(apm_file):
+                st.warning("APMDIAG file not found next to ACONC files; cannot compute PM2.5.")
+            else:
+                # Debugging: Show the path of the APMDIAG file
+                print(f"APMDIAG file located: {apm_file}")
+                ds_apmdiag = xr.open_dataset(apm_file)  # Load APMDIAG file properly
+
+        # Now you can compute PM2.5
+        #if variable == 'PM2.5':
+        #    # Compute PM2.5
+        #    pm25 = compute_pm25_from_aconc_apmdiag(ds, ds_apmdiag, time_index=0, lay=0)  # Adjust time_index and lay
+
+        #    # Create a map of PM2.5
+        #    fig = plot_concentration_with_wind(ds, "PM2.5", lon2d, lat2d, time_index=0, ds_apmdiag, cmaq_time, show_wind=True)
+        #    st.pyplot(fig)
+
 
         tflag = ds["TFLAG"].values[:, 0, :]
         times = []
@@ -470,8 +544,8 @@ if file_list:
         griddesc_file = os.path.join(first_date, domain, "GRIDDESC")
         lon2d, lat2d, grid_info = generate_latlon_grid_from_griddesc(griddesc_file)
 
-        st.sidebar.write(f"Grid resolution: {grid_info['xcell']/1000:.1f} km")
-        st.sidebar.write(f"Grid size: {grid_info['nx']} x {grid_info['ny']}")
+        #st.sidebar.write(f"Grid resolution: {grid_info['xcell']/1000:.1f} km")
+        #st.sidebar.write(f"Grid size: {grid_info['nx']} x {grid_info['ny']}")
 
         print(f"Grid resolution: {grid_info['xcell']/1000:.1f} km")
         print(f"Grid size: {grid_info['nx']} x {grid_info['ny']}")
@@ -498,9 +572,13 @@ if file_list:
                 with placeholder.container():
                     #fig = plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind)
                     # Plot concentration with wind
-                    fig = plot_concentration_with_wind(
-                        ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind=True, nx=grid_info["nx"], ny=grid_info["ny"]
-                    )
+                    if variable == 'PM2.5':
+                        # Compute PM2.5
+                        pm25 = compute_pm25_from_aconc_apmdiag(ds, ds_apmdiag, time_index, lay=0)  # Adjust time_index and lay
+                        # Create a map of PM2.5
+                        fig = plot_concentration_with_wind(ds, "PM2.5", lon2d, lat2d, time_index, ds_apmdiag, cmaq_time, show_wind=True, nx=grid_info["nx"], ny=grid_info["ny"])
+                    else:
+                        fig = plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind=True, nx=grid_info["nx"], ny=grid_info["ny"])
 
                     st.pyplot(fig)
 
@@ -517,13 +595,18 @@ if file_list:
                 with open(output_path, "rb") as f:
                     st.download_button("🎥 Download MP4", f, file_name="cmaq_animation.mp4")
 
-
         else:
             time_index = st.sidebar.slider("Select time index", 0, len(times) - 1, 0)
             cmaq_time = times[time_index]
-            # fig = plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind)
-            fig = plot_concentration_with_wind(
-                ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind=True, nx=grid_info["nx"], ny=grid_info["ny"]
+            if variable == 'PM2.5':
+                # Compute PM2.5
+                pm25 = compute_pm25_from_aconc_apmdiag(ds, ds_apmdiag, time_index, lay=0)  # Adjust time_index and lay
+                # Create a map of PM2.5
+                fig = plot_concentration_with_wind(ds, "PM2.5", lon2d, lat2d, time_index, ds_apmdiag, cmaq_time, show_wind=True, nx=grid_info["nx"], ny=grid_info["ny"])
+            else:
+                # fig = plot_concentration_with_wind(ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind)
+                fig = plot_concentration_with_wind(
+                    ds, variable, lon2d, lat2d, time_index, wrf_ds, cmaq_time, show_wind=True, nx=grid_info["nx"], ny=grid_info["ny"]
             )
             st.pyplot(fig)
 
@@ -533,7 +616,7 @@ if file_list:
         st.subheader("Click on the map to see time series")
         center_lat = np.mean(lat2d)
         center_lon = np.mean(lon2d)
-        fmap = folium.Map(location=[center_lat, center_lon], zoom_start=7)
+        fmap = folium.Map(location=[center_lat, center_lon], zoom_start=5)
 
         stations = [
             {"name": "PARRAMATTA NORTH", "lat": -33.797, "lon": 151.002},
